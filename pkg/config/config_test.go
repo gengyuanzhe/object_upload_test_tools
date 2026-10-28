@@ -1,6 +1,8 @@
 package config
 
 import (
+	"os"
+	"path/filepath"
 	"testing"
 	"time"
 )
@@ -254,5 +256,129 @@ func TestValidateAcceptsValidConfig(t *testing.T) {
 	c.Runner.Total = 10
 	if err := Validate(&c); err != nil {
 		t.Errorf("expected OK, got %v", err)
+	}
+}
+
+func TestLoadParsesSampleYAML(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "minio.yaml")
+	yaml := `
+endpoint:
+  name: minio-local
+  url: http://localhost:9000
+  region: us-east-1
+  access_key: minioadmin
+  secret_key: minioadmin
+  use_path_style: true
+
+bucket: test-bucket
+
+methods: [put, post, multipart, presigned]
+
+method_options:
+  multipart:
+    part_size: 5242880
+  post:
+    success_action_status: 201
+  presigned:
+    expires_in: 3600s
+    method: put
+
+sizes:
+  - [1, 1024, 50]
+  - [1024, 1048576, 30]
+  - [1048576, 10485760, 20]
+
+content:
+  type: random
+  seed: 0
+
+runner:
+  total: 1000
+  concurrency: 32
+  key_prefix: "test/"
+  verify: true
+  cleanup: false
+  timeout: 300s
+  out_prefix: out
+`
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if c.Endpoint.Name != "minio-local" {
+		t.Errorf("name = %q", c.Endpoint.Name)
+	}
+	if len(c.Methods) != 4 {
+		t.Errorf("methods len = %d", len(c.Methods))
+	}
+	if len(c.Sizes) != 3 {
+		t.Errorf("sizes len = %d", len(c.Sizes))
+	}
+	if c.Sizes[0].Min != 1 || c.Sizes[0].Max != 1024 || c.Sizes[0].Weight != 50 {
+		t.Errorf("sizes[0] = %+v", c.Sizes[0])
+	}
+	if c.Runner.Total != 1000 {
+		t.Errorf("total = %d", c.Runner.Total)
+	}
+	if !c.Runner.Verify {
+		t.Errorf("verify = false, want true")
+	}
+}
+
+func TestLoadAppliesDefaultsForOmittedFields(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "min.yaml")
+	yaml := `
+endpoint:
+  url: http://x
+  access_key: k
+  secret_key: s
+bucket: b
+sizes:
+  - [1, 100, 100]
+runner:
+  total: 5
+`
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	c, err := Load(path)
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if c.Endpoint.Region != "us-east-1" {
+		t.Errorf("region default not applied: %q", c.Endpoint.Region)
+	}
+	if !c.Runner.Verify {
+		t.Errorf("verify default not applied")
+	}
+	if c.Runner.Timeout != 300*time.Second {
+		t.Errorf("timeout default not applied")
+	}
+}
+
+func TestLoadRejectsInvalid(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "bad.yaml")
+	yaml := `
+endpoint:
+  url: http://x
+  access_key: ""
+  secret_key: ""
+bucket: b
+sizes:
+  - [1, 100, 100]
+runner:
+  total: 5
+`
+	if err := os.WriteFile(path, []byte(yaml), 0644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := Load(path); err == nil {
+		t.Errorf("expected validation error")
 	}
 }

@@ -7,6 +7,8 @@ import (
 	"os"
 	"strings"
 	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 // Config 表示整个工具的顶层配置结构。
@@ -212,4 +214,60 @@ func Validate(c *Config) error {
 		return errors.New("runner.out_prefix required")
 	}
 	return nil
+}
+
+// UnmarshalYAML 支持 SizeBucket 的两种 YAML 形态：
+// 数组形态 [min, max, weight]（3 元素序列）与结构体形态。
+// 当节点是含 3 个元素的 sequence 时按数组解析，否则按结构体解析。
+func (s *SizeBucket) UnmarshalYAML(value *yaml.Node) error {
+	if value.Kind == yaml.SequenceNode && len(value.Content) == 3 {
+		var arr [3]int64
+		if err := value.Decode(&arr); err != nil {
+			return err
+		}
+		s.Min = arr[0]
+		s.Max = arr[1]
+		s.Weight = int(arr[2])
+		return nil
+	}
+	type alias SizeBucket
+	var a alias
+	if err := value.Decode(&a); err != nil {
+		return err
+	}
+	*s = SizeBucket(a)
+	return nil
+}
+
+// Load 从给定路径读取 YAML 配置文件，解析后应用默认值并校验。
+// 为解决 bool 默认值问题（ApplyDefaults 无法区分「未设置」与「显式 false」），
+// 本函数先解码到 raw map 检测 runner.verify 是否显式存在：
+// 若未显式给出 verify，则强制将 Verify 设为 true。
+func Load(path string) (*Config, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read config: %w", err)
+	}
+	// 先解码到 raw map 以检测显式 bool 取值。
+	var raw map[string]any
+	if err := yaml.Unmarshal(data, &raw); err != nil {
+		return nil, fmt.Errorf("parse yaml: %w", err)
+	}
+	c := &Config{}
+	if err := yaml.Unmarshal(data, c); err != nil {
+		return nil, fmt.Errorf("parse yaml: %w", err)
+	}
+	ApplyDefaults(c)
+	// 若 YAML 未显式给出 verify，则还原 Verify 默认值 true。
+	if rawRunner, ok := raw["runner"].(map[string]any); ok {
+		if _, set := rawRunner["verify"]; !set {
+			c.Runner.Verify = true
+		}
+	} else {
+		c.Runner.Verify = true
+	}
+	if err := Validate(c); err != nil {
+		return nil, fmt.Errorf("validate: %w", err)
+	}
+	return c, nil
 }
