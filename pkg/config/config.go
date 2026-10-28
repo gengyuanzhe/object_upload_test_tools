@@ -1,6 +1,13 @@
 package config
 
-import "time"
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"os"
+	"strings"
+	"time"
+)
 
 // Config 表示整个工具的顶层配置结构。
 // 各字段通过 YAML tag 与配置文件一一对应。
@@ -129,4 +136,80 @@ func NewDefault() Config {
 	ApplyDefaults(&c)
 	c.Runner.Verify = true
 	return c
+}
+
+// validMethods 记录允许的上传方法名称集合。
+var validMethods = map[string]bool{"put": true, "post": true, "multipart": true, "presigned": true}
+
+// validContentTypes 记录允许的 content.type 取值集合。
+var validContentTypes = map[string]bool{"random": true, "fixed": true, "file": true}
+
+// Validate 按规则逐项校验 Config，任一规则不满足即返回错误。
+// 校验顺序与字段声明顺序基本一致，先校验基础必填项，再校验取值范围与互斥条件。
+func Validate(c *Config) error {
+	if _, err := url.Parse(c.Endpoint.URL); err != nil || c.Endpoint.URL == "" {
+		return fmt.Errorf("endpoint.url invalid: %q", c.Endpoint.URL)
+	}
+	if c.Endpoint.AccessKey == "" || c.Endpoint.SecretKey == "" {
+		return errors.New("endpoint.access_key and endpoint.secret_key required")
+	}
+	if c.Bucket == "" {
+		return errors.New("bucket required")
+	}
+	if len(c.Methods) == 0 {
+		return errors.New("methods required (at least one of put/post/multipart/presigned)")
+	}
+	for _, m := range c.Methods {
+		if !validMethods[m] {
+			return fmt.Errorf("invalid method %q", m)
+		}
+	}
+	if c.MethodOptions.Multipart.PartSize < 5242880 {
+		return fmt.Errorf("method_options.multipart.part_size must be >= 5MiB, got %d", c.MethodOptions.Multipart.PartSize)
+	}
+	if len(c.Sizes) == 0 {
+		return errors.New("sizes required (at least one bucket)")
+	}
+	sum := 0
+	for i, b := range c.Sizes {
+		if b.Min < 0 {
+			return fmt.Errorf("sizes[%d].min must be >= 0", i)
+		}
+		if b.Min > b.Max {
+			return fmt.Errorf("sizes[%d].min (%d) > max (%d)", i, b.Min, b.Max)
+		}
+		sum += b.Weight
+	}
+	if sum < 99 || sum > 101 {
+		return fmt.Errorf("sizes weights must sum to 100 (±1), got %d", sum)
+	}
+	if !validContentTypes[c.Content.Type] {
+		return fmt.Errorf("content.type must be random|fixed|file, got %q", c.Content.Type)
+	}
+	if c.Content.Type == "fixed" {
+		if c.Content.Char < 0 || c.Content.Char > 255 {
+			return fmt.Errorf("content.char must be 0..255, got %d", c.Content.Char)
+		}
+	}
+	if c.Content.Type == "file" {
+		if c.Content.Path == "" {
+			return errors.New("content.path required when content.type=file")
+		}
+		if _, err := os.Stat(c.Content.Path); err != nil {
+			return fmt.Errorf("content.path not accessible: %w", err)
+		}
+	}
+	if c.Runner.Total <= 0 {
+		return fmt.Errorf("runner.total must be > 0, got %d", c.Runner.Total)
+	}
+	if c.Runner.Concurrency <= 0 {
+		return fmt.Errorf("runner.concurrency must be > 0, got %d", c.Runner.Concurrency)
+	}
+	if c.Runner.Timeout <= 0 {
+		return fmt.Errorf("runner.timeout must be > 0, got %v", c.Runner.Timeout)
+	}
+	if strings.TrimSpace(c.Runner.OutPrefix) == "" {
+		return errors.New("runner.out_prefix required")
+	}
+	return nil
 }

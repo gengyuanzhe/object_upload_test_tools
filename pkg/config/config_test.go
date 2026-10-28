@@ -54,7 +54,7 @@ func TestApplyDefaultsFillsAllFields(t *testing.T) {
 func TestApplyDefaultsDoesNotOverrideSetValues(t *testing.T) {
 	c := Config{
 		Endpoint: EndpointConfig{Region: "eu-west-1"},
-		Runner:  RunnerConfig{Concurrency: 64},
+		Runner:   RunnerConfig{Concurrency: 64},
 	}
 	ApplyDefaults(&c)
 	if c.Endpoint.Region != "eu-west-1" {
@@ -117,5 +117,142 @@ func TestNewDefault(t *testing.T) {
 	}
 	if c.Runner.OutPrefix != "out" {
 		t.Errorf("out_prefix default = %q, want out", c.Runner.OutPrefix)
+	}
+}
+
+func TestValidateRejectsInvalidURL(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "://bad"
+	c.Endpoint.AccessKey = "k"
+	c.Endpoint.SecretKey = "s"
+	c.Bucket = "b"
+	c.Sizes = []SizeBucket{{Min: 1, Max: 100, Weight: 100}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for bad URL")
+	}
+}
+
+func TestValidateRejectsEmptyCredentials(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://x"
+	c.Endpoint.AccessKey = ""
+	c.Endpoint.SecretKey = ""
+	c.Bucket = "b"
+	c.Sizes = []SizeBucket{{Min: 1, Max: 100, Weight: 100}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for empty credentials")
+	}
+}
+
+func TestValidateRejectsBadMethod(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://x"
+	c.Endpoint.AccessKey = "k"
+	c.Endpoint.SecretKey = "s"
+	c.Bucket = "b"
+	c.Methods = []string{"frob"}
+	c.Sizes = []SizeBucket{{Min: 1, Max: 100, Weight: 100}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for bad method")
+	}
+}
+
+func TestValidateRejectsSmallPartSize(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://x"
+	c.Endpoint.AccessKey = "k"
+	c.Endpoint.SecretKey = "s"
+	c.Bucket = "b"
+	c.MethodOptions.Multipart.PartSize = 1024
+	c.Sizes = []SizeBucket{{Min: 1, Max: 100, Weight: 100}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for part_size < 5MiB")
+	}
+}
+
+func TestValidateRejectsBadWeightSum(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://x"
+	c.Endpoint.AccessKey = "k"
+	c.Endpoint.SecretKey = "s"
+	c.Bucket = "b"
+	c.Sizes = []SizeBucket{{Min: 1, Max: 100, Weight: 50}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for weights summing to 50")
+	}
+}
+
+func TestValidateRejectsInvertedSize(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://x"
+	c.Endpoint.AccessKey = "k"
+	c.Endpoint.SecretKey = "s"
+	c.Bucket = "b"
+	c.Sizes = []SizeBucket{{Min: 100, Max: 1, Weight: 100}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for min>max")
+	}
+}
+
+func TestValidateRejectsBadContentType(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://x"
+	c.Endpoint.AccessKey = "k"
+	c.Endpoint.SecretKey = "s"
+	c.Bucket = "b"
+	c.Content.Type = "frob"
+	c.Sizes = []SizeBucket{{Min: 1, Max: 100, Weight: 100}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for bad content type")
+	}
+}
+
+func TestValidateRejectsBadChar(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://x"
+	c.Endpoint.AccessKey = "k"
+	c.Endpoint.SecretKey = "s"
+	c.Bucket = "b"
+	c.Content.Type = "fixed"
+	c.Content.Char = 256
+	c.Sizes = []SizeBucket{{Min: 1, Max: 100, Weight: 100}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for char > 255")
+	}
+}
+
+func TestValidateRejectsMissingFilePath(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://x"
+	c.Endpoint.AccessKey = "k"
+	c.Endpoint.SecretKey = "s"
+	c.Bucket = "b"
+	c.Content.Type = "file"
+	c.Content.Path = "/nonexistent/path/xyz"
+	c.Sizes = []SizeBucket{{Min: 1, Max: 100, Weight: 100}}
+	c.Runner.Total = 1
+	if err := Validate(&c); err == nil {
+		t.Errorf("expected error for missing file path")
+	}
+}
+
+func TestValidateAcceptsValidConfig(t *testing.T) {
+	c := NewDefault()
+	c.Endpoint.URL = "http://localhost:9000"
+	c.Endpoint.AccessKey = "minioadmin"
+	c.Endpoint.SecretKey = "minioadmin"
+	c.Bucket = "test"
+	c.Sizes = []SizeBucket{{Min: 1, Max: 1024, Weight: 100}}
+	c.Runner.Total = 10
+	if err := Validate(&c); err != nil {
+		t.Errorf("expected OK, got %v", err)
 	}
 }
