@@ -62,6 +62,32 @@ func TestRandomGeneratorType(t *testing.T) {
 	}
 }
 
+// TestFixedCharGeneratorFillsByte 验证 FixedCharGenerator 将 size 字节缓冲区
+// 全部填充为 Char 指定的字节值。覆盖 0x00、'a'、0xFF 三个典型取值，
+// 每次生成 256 字节并逐字节比对，确保填充行为与具体字节无关。
+func TestFixedCharGeneratorFillsByte(t *testing.T) {
+	for _, c := range []byte{0x00, 'a', 0xFF} {
+		g := &FixedCharGenerator{Char: c}
+		r, _ := g.Generate(256, 0)
+		b := mustReadAll(t, r)
+		if len(b) != 256 {
+			t.Errorf("len = %d, want 256", len(b))
+		}
+		for i, x := range b {
+			if x != c {
+				t.Errorf("byte[%d] = %d, want %d", i, x, c)
+			}
+		}
+	}
+}
+
+// TestFixedCharGeneratorType 验证类型标识为 "fixed"。
+func TestFixedCharGeneratorType(t *testing.T) {
+	if (&FixedCharGenerator{}).Type() != "fixed" {
+		t.Errorf("Type() != fixed")
+	}
+}
+
 // mustReadAll 读取 r 的全部内容，出错时终止测试。
 // 该辅助函数集中处理 io.ReadAll 的错误，使测试主体保持简洁。
 func mustReadAll(t *testing.T, r io.Reader) []byte {
