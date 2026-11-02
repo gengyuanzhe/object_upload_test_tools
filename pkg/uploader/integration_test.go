@@ -7,8 +7,9 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
-	"errors"
 	"io"
+	"mime"
+	"mime/multipart"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -236,12 +237,29 @@ func TestAwsPresignedUploaderPUTIntegration(t *testing.T) {
 	}
 }
 
-// TestAwsPresignedUploaderPOSTNotImplemented 验证当 PresignedSpec.Method == "post" 时，
-// Upload 返回 ErrPresignedPostNotImplemented 哨兵错误。
-// Task 12 将移除该哨兵并委托至 AwsPoster 的 POST policy 流程。
-func TestAwsPresignedUploaderPOSTNotImplemented(t *testing.T) {
+// TestAwsPresignedUploaderPOSTDelegates 验证 AwsPresignedUploader 在
+// PresignedSpec.Method == "post" 时委托至 AwsPoster 的 POST policy 流程，
+// 并返回与服务端 mock 一致的成功结果。
+//
+// 该测试替代了原先的 TestAwsPresignedUploaderPOSTNotImplemented：Task 12
+// 移除了 ErrPresignedPostNotImplemented 哨兵，POST 分支改为委托给 AwsPoster。
+// Mock 不校验 SigV4 签名，仅用于验证请求体与响应处理。
+//
+// Mock 行为：模拟 S3 POST policy 的成功响应——解析 multipart 表单提取 "file"
+// 字段内容，计算其 MD5 作为 ETag（带双引号）返回，状态码 201。这样 ETag 与
+// 客户端对原始内容计算的 hex MD5 一致，可验证 trim 行为。
+func TestAwsPresignedUploaderPOSTDelegates(t *testing.T) {
+	var gotBody []byte
+	var gotContentType string
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(200)
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		gotContentType = r.Header.Get("Content-Type")
+		// 从 multipart 表单中提取 file 字段内容，模拟 S3 按对象内容计算 ETag。
+		fileContent := extractFileContent(t, gotContentType, body)
+		sum := md5.Sum(fileContent)
+		w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+		w.WriteHeader(201)
 	}))
 	t.Cleanup(srv.Close)
 	cl := s3.New(s3.Options{
@@ -250,15 +268,117 @@ func TestAwsPresignedUploaderPOSTNotImplemented(t *testing.T) {
 		Credentials:  credentials.NewStaticCredentialsProvider("ak", "sk", ""),
 		UsePathStyle: true,
 	})
+
 	u := &AwsPresignedUploader{client: cl, presigner: s3.NewPresignClient(cl)}
-	_, err := u.Upload(context.Background(), UploadSpec{
+	res, err := u.Upload(context.Background(), UploadSpec{
 		Bucket:    "b",
 		Key:       "k",
-		Content:   bytes.NewReader([]byte("x")),
-		Size:      1,
-		Presigned: &PresignedSpec{ExpiresIn: 60 * time.Second, Method: "post"},
+		Content:   bytes.NewReader([]byte("post-body")),
+		Size:      9,
+		Presigned: &PresignedSpec{Method: "post", ExpiresIn: 60 * time.Second},
+		Post:      &PostSpec{SuccessActionStatus: 201},
 	})
-	if !errors.Is(err, ErrPresignedPostNotImplemented) {
-		t.Fatalf("err = %v, want ErrPresignedPostNotImplemented", err)
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if !strings.Contains(string(gotBody), "post-body") {
+		t.Errorf("body did not contain upload: %q", gotBody)
+	}
+	if !strings.HasPrefix(gotContentType, "multipart/form-data") {
+		t.Errorf("Content-Type = %q, want prefix %q", gotContentType, "multipart/form-data")
+	}
+	if res.BytesIn != 9 {
+		t.Errorf("BytesIn = %d, want 9", res.BytesIn)
+	}
+	wantSum := md5.Sum([]byte("post-body"))
+	wantETag := hex.EncodeToString(wantSum[:])
+	if res.ETag != wantETag {
+		t.Errorf("ETag = %q, want %q (raw hex MD5, quotes trimmed)", res.ETag, wantETag)
+	}
+	if res.Elapsed <= 0 {
+		t.Errorf("Elapsed = %v, want > 0", res.Elapsed)
+	}
+}
+
+// TestAwsPosterIntegration 验证 AwsPoster 经由 httptest.Server 完成一次 POST policy
+// 上传后，能正确返回 ETag（已去引号）、BytesIn、Elapsed，并通过 multipart/form-data
+// 请求体把内容透传至服务端。
+//
+// 服务端按 S3 习惯返回 ETag: "<hex-md5>"（带双引号）+ 状态码 201；客户端必须 trim
+// 双引号，使 res.ETag 可与本地对相同内容计算的 hex MD5 直接比较。
+// Mock 不校验 SigV4 签名，仅用于验证请求体、Content-Type 与响应处理。
+func TestAwsPosterIntegration(t *testing.T) {
+	var gotBody []byte
+	var gotContentType string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		gotContentType = r.Header.Get("Content-Type")
+		fileContent := extractFileContent(t, gotContentType, body)
+		sum := md5.Sum(fileContent)
+		w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+		w.WriteHeader(201)
+	}))
+	t.Cleanup(srv.Close)
+	cl := s3.New(s3.Options{
+		BaseEndpoint: aws.String(srv.URL),
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider("ak", "sk", ""),
+		UsePathStyle: true,
+	})
+
+	p := &AwsPoster{client: cl}
+	if p.Method() != "post" {
+		t.Fatalf("Method() = %q, want %q", p.Method(), "post")
+	}
+	res, err := p.Upload(context.Background(), UploadSpec{
+		Bucket:  "b",
+		Key:     "k",
+		Content: bytes.NewReader([]byte("post-body")),
+		Size:    9,
+		Post:    &PostSpec{SuccessActionStatus: 201},
+	})
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if !strings.Contains(string(gotBody), "post-body") {
+		t.Errorf("body did not contain upload: %q", gotBody)
+	}
+	if !strings.HasPrefix(gotContentType, "multipart/form-data") {
+		t.Errorf("Content-Type = %q, want prefix %q", gotContentType, "multipart/form-data")
+	}
+	if res.BytesIn != 9 {
+		t.Errorf("BytesIn = %d, want 9", res.BytesIn)
+	}
+	if res.Elapsed <= 0 {
+		t.Errorf("Elapsed = %v, want > 0", res.Elapsed)
+	}
+	wantSum := md5.Sum([]byte("post-body"))
+	wantETag := hex.EncodeToString(wantSum[:])
+	if res.ETag != wantETag {
+		t.Errorf("ETag = %q, want %q (raw hex MD5, quotes trimmed)", res.ETag, wantETag)
+	}
+}
+
+// extractFileContent 从 multipart/form-data 请求体中提取 "file" 字段的内容字节。
+// 模拟 S3 按对象内容（而非整段 multipart body）计算 ETag 的行为。
+// 提取失败时返回 nil，调用方对 nil 计算 MD5 会得到一个固定值，测试断言会失败
+// 并暴露问题。
+func extractFileContent(t *testing.T, contentType string, body []byte) []byte {
+	t.Helper()
+	_, params, err := mime.ParseMediaType(contentType)
+	if err != nil {
+		return nil
+	}
+	mr := multipart.NewReader(bytes.NewReader(body), params["boundary"])
+	for {
+		part, err := mr.NextPart()
+		if err != nil {
+			return nil
+		}
+		if part.FormName() == "file" {
+			content, _ := io.ReadAll(part)
+			return content
+		}
 	}
 }
