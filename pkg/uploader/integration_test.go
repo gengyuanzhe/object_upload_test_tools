@@ -7,11 +7,13 @@ import (
 	"context"
 	"crypto/md5"
 	"encoding/hex"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/credentials"
@@ -178,5 +180,85 @@ func TestAwsMultipartUploaderIntegration(t *testing.T) {
 				t.Errorf("part[%d] MD5 = %q, server = %q", i, parts[i], recordedPartMD5s[i])
 			}
 		}
+	}
+}
+
+// TestAwsPresignedUploaderPUTIntegration 验证 AwsPresignedUploader 经由 httptest.Server 完成一次
+// PUT presign 上传后，能正确返回 ETag（已去引号）、BytesIn，并将请求体透传至服务端。
+//
+// 服务端按 S3 习惯返回 ETag: "<hex-md5>"（带双引号）；客户端必须 trim 双引号，
+// 使 res.ETag 可与本地对相同内容计算的 hex MD5 直接比较。
+func TestAwsPresignedUploaderPUTIntegration(t *testing.T) {
+	var gotBody []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		gotBody = body
+		sum := md5.Sum(body)
+		w.Header().Set("ETag", `"`+hex.EncodeToString(sum[:])+`"`)
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(srv.Close)
+	cl := s3.New(s3.Options{
+		BaseEndpoint: aws.String(srv.URL),
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider("ak", "sk", ""),
+		UsePathStyle: true,
+	})
+
+	u := &AwsPresignedUploader{client: cl, presigner: s3.NewPresignClient(cl)}
+	if u.Method() != "presigned" {
+		t.Fatalf("Method() = %q, want %q", u.Method(), "presigned")
+	}
+	res, err := u.Upload(context.Background(), UploadSpec{
+		Bucket:    "b",
+		Key:       "k",
+		Content:   bytes.NewReader([]byte("presigned-body")),
+		Size:      14,
+		Presigned: &PresignedSpec{ExpiresIn: 60 * time.Second, Method: "put"},
+	})
+	if err != nil {
+		t.Fatalf("Upload: %v", err)
+	}
+	if string(gotBody) != "presigned-body" {
+		t.Errorf("body = %q, want %q", gotBody, "presigned-body")
+	}
+	if res.BytesIn != 14 {
+		t.Errorf("BytesIn = %d, want 14", res.BytesIn)
+	}
+	// 预期 ETag 为本地对 "presigned-body" 计算的 hex MD5（无引号）。
+	wantSum := md5.Sum([]byte("presigned-body"))
+	wantETag := hex.EncodeToString(wantSum[:])
+	if res.ETag != wantETag {
+		t.Errorf("ETag = %q, want %q (raw hex MD5, quotes trimmed)", res.ETag, wantETag)
+	}
+	if res.Elapsed <= 0 {
+		t.Errorf("Elapsed = %v, want > 0", res.Elapsed)
+	}
+}
+
+// TestAwsPresignedUploaderPOSTNotImplemented 验证当 PresignedSpec.Method == "post" 时，
+// Upload 返回 ErrPresignedPostNotImplemented 哨兵错误。
+// Task 12 将移除该哨兵并委托至 AwsPoster 的 POST policy 流程。
+func TestAwsPresignedUploaderPOSTNotImplemented(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(200)
+	}))
+	t.Cleanup(srv.Close)
+	cl := s3.New(s3.Options{
+		BaseEndpoint: aws.String(srv.URL),
+		Region:       "us-east-1",
+		Credentials:  credentials.NewStaticCredentialsProvider("ak", "sk", ""),
+		UsePathStyle: true,
+	})
+	u := &AwsPresignedUploader{client: cl, presigner: s3.NewPresignClient(cl)}
+	_, err := u.Upload(context.Background(), UploadSpec{
+		Bucket:    "b",
+		Key:       "k",
+		Content:   bytes.NewReader([]byte("x")),
+		Size:      1,
+		Presigned: &PresignedSpec{ExpiresIn: 60 * time.Second, Method: "post"},
+	})
+	if !errors.Is(err, ErrPresignedPostNotImplemented) {
+		t.Fatalf("err = %v, want ErrPresignedPostNotImplemented", err)
 	}
 }
