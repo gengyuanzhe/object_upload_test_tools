@@ -4,6 +4,8 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"io"
+	"os"
+	"path/filepath"
 	"testing"
 )
 
@@ -97,4 +99,32 @@ func mustReadAll(t *testing.T, r io.Reader) []byte {
 		t.Fatal(err)
 	}
 	return b
+}
+
+// TestFileGeneratorOpensFile 验证 FileGenerator 通过 os.Open 打开 Path 指向的文件，
+// 并返回完整可读的 io.Reader。size 与 taskID 参数在该实现中被忽略，
+// 调用方（runner）负责通过 os.Stat 单独填充 UploadSpec.Size。
+func TestFileGeneratorOpensFile(t *testing.T) {
+	dir := t.TempDir()
+	p := filepath.Join(dir, "data.bin")
+	content := []byte{0xde, 0xad, 0xbe, 0xef}
+	if err := os.WriteFile(p, content, 0644); err != nil {
+		t.Fatal(err)
+	}
+	g := &FileGenerator{Path: p}
+	r, err := g.Generate(999, 7) // size param ignored
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := mustReadAll(t, r)
+	if string(got) != string(content) {
+		t.Errorf("content mismatch: got %v want %v", got, content)
+	}
+}
+
+// TestFileGeneratorType 验证类型标识为 "file"。
+func TestFileGeneratorType(t *testing.T) {
+	if (&FileGenerator{}).Type() != "file" {
+		t.Errorf("Type() != file")
+	}
 }

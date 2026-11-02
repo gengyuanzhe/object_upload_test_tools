@@ -15,15 +15,14 @@ type Generator interface {
 }
 
 // NewFromConfig 根据 cfg 的 Type 字段选择并返回对应的 Generator 实现。
-// 当前已实现 "random" 与 "fixed" 两种类型；"file" 的具体实现由
-// Task 7（FileGenerator）补全，届时将把对应 case 的返回值替换为真实实现。
+// 当前已实现 "random"、"fixed" 与 "file" 三种类型：未识别的 Type
+// 退化为 RandomGenerator，以保证默认行为可重现且无副作用。
 func NewFromConfig(cfg config.ContentConfig) Generator {
 	switch cfg.Type {
 	case "fixed":
 		return &FixedCharGenerator{Char: byte(cfg.Char)}
 	case "file":
-		// TODO: Task 7 将补全 FileGenerator{Path: cfg.Path}。
-		return nil
+		return &FileGenerator{Path: cfg.Path}
 	default:
 		return &RandomGenerator{BaseSeed: cfg.Seed}
 	}
