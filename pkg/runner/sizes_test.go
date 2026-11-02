@@ -79,3 +79,23 @@ func TestSamplerBounds(t *testing.T) {
 		}
 	}
 }
+
+// TestSamplerSeedAffectsSequence 验证 NewSampler 的 seed 参数真正影响采样序列：
+// 两个 Sampler 用相同的 buckets 与 taskID 范围，但 seed 不同，
+// 其输出序列必须存在差异（否则 seed 为死参数）。
+// 此测试针对 Task 15 review 的 Important I1——seed 死参数缺陷已修复，
+// 此测试固化修复行为，防止回归。
+func TestSamplerSeedAffectsSequence(t *testing.T) {
+	buckets := []config.SizeBucket{{Min: 1, Max: 1000000, Weight: 100}}
+	s1 := NewSampler(buckets, 42)
+	s2 := NewSampler(buckets, 999)
+	diffCount := 0
+	for i := 0; i < 100; i++ {
+		if s1.Sample(i) != s2.Sample(i) {
+			diffCount++
+		}
+	}
+	if diffCount == 0 {
+		t.Errorf("seed 未影响采样序列：100 次采样全部相同，seed 为死参数")
+	}
+}

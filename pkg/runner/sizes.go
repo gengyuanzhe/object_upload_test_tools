@@ -17,16 +17,18 @@ type Sampler struct {
 	buckets    []config.SizeBucket
 	cumulative []int
 	total      int
+	seed       int64
 }
 
 // NewSampler 基于一组 SizeBucket 与全局种子构造 Sampler。
 //
 // 构造过程仅累计各 bucket 的 Weight 形成前缀和，不拷贝 buckets 切片
 // （调用方在构造后不应再修改传入切片的元素，否则可能破坏加权一致性）。
-// seed 用于在 Sample 中与 taskID 混合派生每次采样的 PRNG 种子，
-// 相同 seed 下整个采样序列可复现。
+// seed 持久化到 Sampler，并在每次 Sample 调用时与 taskID、bucket 数
+// 一起混合派生 PRNG 种子；相同 (seed, taskID, buckets) 三元组产生完全
+// 一致的字节序列，不同 seed 产生不同的采样序列。
 func NewSampler(buckets []config.SizeBucket, seed int64) *Sampler {
-	s := &Sampler{buckets: buckets}
+	s := &Sampler{buckets: buckets, seed: seed}
 	cum := 0
 	for _, b := range buckets {
 		cum += b.Weight
@@ -39,17 +41,17 @@ func NewSampler(buckets []config.SizeBucket, seed int64) *Sampler {
 // Sample 根据 taskID 返回一个落在某个 bucket 的 [Min, Max] 闭区间内的字节数。
 //
 // 采样过程两阶段：
-//  1. 用 (黄金分割常数 ^ taskID ^ bucket 数) 派生 PRNG 种子，
+//  1. 用 (黄金分割常数 ^ seed ^ taskID ^ bucket 数) 派生 PRNG 种子，
 //     先做一次加权 roll（IntN(total)）选择 bucket 下标；
 //  2. 在所选 bucket 内做一次均匀采样：若 Min == Max 直接返回 Min，
 //     否则返回 Min + Int64N(span+1)，其中 span = Max - Min，
 //     闭区间 [Min, Max] 共 span+1 个取值。
 //
 // 注意：0x9E3779B97F4A7C15 是 64 位黄金分割常数，超出 int64 正数范围，
-// 故以 uint64 运算后再转换为 int64 位模式；同时 math/rand/v2 不存在
+// 故以 uint64 运算后再喂给 NewPCG；同时 math/rand/v2 不存在
 // NewSource，故使用 NewPCG 作为唯一的有状态 PRNG 构造器（与 Task 5 一致）。
 func (s *Sampler) Sample(taskID int) int64 {
-	seed := uint64(0x9E3779B97F4A7C15) ^ uint64(taskID) ^ uint64(len(s.buckets))
+	seed := uint64(0x9E3779B97F4A7C15) ^ uint64(s.seed) ^ uint64(taskID) ^ uint64(len(s.buckets))
 	prng := rand.New(rand.NewPCG(seed, 0))
 
 	roll := prng.IntN(s.total)
