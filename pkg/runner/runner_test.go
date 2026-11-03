@@ -133,14 +133,22 @@ func TestRunnerKeyFormat(t *testing.T) {
 // 与 mockUploader 区别：mockUploader 立即返回，无法模拟 worker
 // 在飞行中被 cancel 的场景；slowUploader 通过 select { time.After / ctx.Done }
 // 让 worker 的 Upload 调用能感知 ctx 取消并快速返回。
-type slowUploader struct{ method string }
+//
+// delay 控制每次 Upload 的固定 sleep 时长；零值表示不 sleep（用于 TestRunnerGracefulShutdown
+// 之外的测试，避免总耗时过长）。default 用 50ms 仅在 graceful shutdown 测试中显式传入。
+type slowUploader struct {
+	method string
+	delay  time.Duration
+}
 
 func (s *slowUploader) Method() string { return s.method }
 func (s *slowUploader) Upload(ctx context.Context, spec uploader.UploadSpec) (uploader.UploadResult, error) {
-	select {
-	case <-time.After(50 * time.Millisecond):
-	case <-ctx.Done():
-		return uploader.UploadResult{}, ctx.Err()
+	if s.delay > 0 {
+		select {
+		case <-time.After(s.delay):
+		case <-ctx.Done():
+			return uploader.UploadResult{}, ctx.Err()
+		}
 	}
 	_, _ = io.Copy(io.Discard, spec.Content)
 	return uploader.UploadResult{BytesIn: spec.Size}, nil
@@ -164,7 +172,7 @@ func TestRunnerGracefulShutdownReturnsPartialReport(t *testing.T) {
 	// slow mock：每次 Upload sleep 50ms，让 cancel 落在 Upload 飞行期间。
 	cfg.UploaderFactory = map[string]func(*s3.Client) uploader.Uploader{
 		"put": func(c *s3.Client) uploader.Uploader {
-			return &slowUploader{method: "put"}
+			return &slowUploader{method: "put", delay: 50 * time.Millisecond}
 		},
 	}
 	r := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
@@ -291,5 +299,56 @@ func TestRunnerClosesFileReader(t *testing.T) {
 		t.Errorf("gen.LastFile().Close() 返回 nil，期望 os.ErrClosed —— executeTask 未关闭 fd，存在 fd 泄漏")
 	} else if !errors.Is(err, os.ErrClosed) {
 		t.Errorf("gen.LastFile().Close() err = %v，期望 os.ErrClosed", err)
+	}
+}
+
+// TestRunnerProgressReportsResults 验证 Config.Progress 接线正确：
+// Run 入口 Start，每个 Result 落地时调 IncSuccess / IncFailed / IncBytes，
+// 结束 Stop(true)。
+//
+// 断言：
+//   - success + failed == Total（每个 Result 都被回调）；
+//   - bytes == sum(Result.Size)（IncBytes 用 Result.Size，与 throughput 语义一致）。
+//
+// 若 Run 内部忘记调 Inc* 或字段接线错误，success/failed 会为 0，测试失败。
+func TestRunnerProgressReportsResults(t *testing.T) {
+	cfg := newTestRunnerCfg(50, 4, []string{"put"})
+	// 用一个慢速 mockUploader 制造可见的进度 tick（每 Task 10ms，50 Task / 4 worker ≈ 125ms，
+	// Progress ticker 200ms 可能只 tick 一次或零次，但 Inc* 调用与 tick 频率无关，
+	// 计数器在 Stop 时读取，必定反映全部 Result）。
+	cfg.UploaderFactory = map[string]func(*s3.Client) uploader.Uploader{
+		"put": func(c *s3.Client) uploader.Uploader {
+			return &slowUploader{method: "put", delay: 10 * time.Millisecond}
+		},
+	}
+	progress := NewProgress(50, io.Discard) // 非 TTY（io.Discard 不是 *os.File），用 plain text 模式
+	cfg.Progress = progress
+
+	r := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	rep, err := r.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	success := progress.success.Load()
+	failed := progress.failed.Load()
+	bytes := progress.bytes.Load()
+
+	if int(success+failed) != 50 {
+		t.Errorf("success+failed = %d, want 50 (Total)", success+failed)
+	}
+	if int(success) != rep.Summary.Success {
+		t.Errorf("progress.success = %d, rep.Summary.Success = %d", success, rep.Summary.Success)
+	}
+	if int(failed) != rep.Summary.Failed {
+		t.Errorf("progress.failed = %d, rep.Summary.Failed = %d", failed, rep.Summary.Failed)
+	}
+
+	var wantBytes int64
+	for _, res := range rep.Results {
+		wantBytes += res.Size
+	}
+	if bytes != wantBytes {
+		t.Errorf("progress.bytes = %d, want %d (sum of Result.Size)", bytes, wantBytes)
 	}
 }

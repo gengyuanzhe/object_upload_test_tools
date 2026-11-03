@@ -247,6 +247,7 @@ func runReal(cfg config.Config, reportResults bool, logger *slog.Logger, stderr 
 		MultipartPartSize: cfg.MethodOptions.Multipart.PartSize, // pre-flight T17 ruling #2
 		S3Client:          s3Client,
 		UploaderFactory:   uploader.NewAwsUploaderFactory(),
+		Progress:          runner.NewProgress(cfg.Runner.Total, stderr),
 	}
 
 	r := runner.New(rcfg, logger)

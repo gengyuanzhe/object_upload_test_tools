@@ -57,7 +57,10 @@ import (
 //   - MultipartPartSize：multipart 上传的分片大小（pre-flight T17 ruling），
 //     0 表示使用默认 5 MiB；Task 21 的 runReal 会从
 //     cfg.MethodOptions.Multipart.PartSize 填入；
-//   - S3Client / UploaderFactory：S3 客户端与上传器工厂映射。
+//   - S3Client / UploaderFactory：S3 客户端与上传器工厂映射；
+//   - Progress：可选进度条 hook（*Progress）。nil 表示不显示进度；
+//     非 nil 时 Run 会在入口 Start，每个 Result 落地时调 IncSuccess /
+//     IncFailed / IncBytes，结束 Stop(true)。
 type Config struct {
 	EndpointName      string
 	EndpointURL       string
@@ -76,6 +79,7 @@ type Config struct {
 	MultipartPartSize int64
 	S3Client          *s3.Client
 	UploaderFactory   map[string]func(*s3.Client) uploader.Uploader
+	Progress          *Progress
 }
 
 // Runner 是绑定了 Config 与 logger 的运行器实例。
@@ -98,17 +102,24 @@ func New(cfg Config, logger *slog.Logger) *Runner {
 // Run 启动 worker pool 执行全部 Task，并在结束后返回组装好的 Report。
 //
 // 流程：
-//  1. 记录 startedAt，构造 Sampler 与 buildTasks 的全部 Task；
-//  2. 创建 taskCh（无缓冲）与 resultCh（缓冲容量 = Total）；
-//  3. 启动 Concurrency 个 worker goroutine 从 taskCh 消费 Task；
-//  4. 启动一个 producer goroutine 将 Task 序列写入 taskCh，写完后关闭 taskCh；
-//  5. 启动一个 closer goroutine 等所有 worker 退出后关闭 resultCh；
-//  6. 主 goroutine 串行从 resultCh 收集全部 Result；
-//  7. 计算 endedAt 与 duration，调用 buildReport 组装 Report 返回。
+//  1. 若 Config.Progress 非 nil，调用 Start 启动进度条 ticker，并在 defer 中
+//     Stop(true) 渲染最终状态行；
+//  2. 记录 startedAt，构造 Sampler 与 buildTasks 的全部 Task；
+//  3. 创建 taskCh（无缓冲）与 resultCh（缓冲容量 = Total）；
+//  4. 启动 Concurrency 个 worker goroutine 从 taskCh 消费 Task；
+//  5. 启动一个 producer goroutine 将 Task 序列写入 taskCh，写完后关闭 taskCh；
+//  6. 启动一个 closer goroutine 等所有 worker 退出后关闭 resultCh；
+//  7. 主 goroutine 串行从 resultCh 收集全部 Result，每个 Result 落地时
+//     回调 Progress.IncSuccess / IncFailed / IncBytes（若 Progress 非 nil）；
+//  8. 计算 endedAt 与 duration，调用 buildReport 组装 Report 返回。
 //
 // ctx 取消时，producer 与 worker 会通过 select 响应 ctx.Done() 退出，
 // 已收集的部分 Result 仍会被组装到 Report 中（graceful shutdown）。
 func (r *Runner) Run(ctx context.Context) (*Report, error) {
+	if r.cfg.Progress != nil {
+		r.cfg.Progress.Start()
+		defer r.cfg.Progress.Stop(true)
+	}
 	startedAt := time.Now()
 	sampler := NewSampler(r.cfg.Sizes, r.cfg.ContentSeed)
 	tasks := r.buildTasks(startedAt, sampler)
@@ -148,8 +159,17 @@ func (r *Runner) Run(ctx context.Context) (*Report, error) {
 
 	// 主 goroutine 串行收集所有 Result。
 	// for-range 在 resultCh 关闭且缓冲排空后自然退出。
+	// 若 Config.Progress 非 nil，每个 Result 落地时回调 Inc* 方法更新进度条。
 	results := make([]Result, 0, len(tasks))
 	for res := range resultCh {
+		if r.cfg.Progress != nil {
+			if res.Status == StatusSuccess {
+				r.cfg.Progress.IncSuccess(1)
+			} else {
+				r.cfg.Progress.IncFailed(1)
+			}
+			r.cfg.Progress.IncBytes(res.Size)
+		}
 		results = append(results, res)
 	}
 
