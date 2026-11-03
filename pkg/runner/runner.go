@@ -256,6 +256,11 @@ func (r *Runner) executeTask(ctx context.Context, task Task) Result {
 			Status: StatusFailedUpload, ErrMessage: err.Error(), Elapsed: time.Since(start),
 		}
 	}
+	// 兼容 io.ReadCloser：FileGenerator 返回 *os.File，必须关闭以避免 fd 泄漏；
+	// RandomGenerator / FixedCharGenerator 返回非 Closer 的 Reader，类型断言失败即跳过。
+	if rc, ok := reader.(io.ReadCloser); ok {
+		defer rc.Close()
+	}
 
 	// TeeReader 在 Uploader 读取 Content 时同步累积 MD5，
 	// 避免对内容做二次全量扫描。

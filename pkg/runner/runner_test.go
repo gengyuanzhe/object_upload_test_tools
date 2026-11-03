@@ -6,6 +6,9 @@ import (
 	"errors"
 	"io"
 	"log/slog"
+	"os"
+	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
@@ -192,5 +195,101 @@ func TestRunnerGracefulShutdownReturnsPartialReport(t *testing.T) {
 		t.Logf("warning: rep.Summary.Total == 0 (slow machine: no Task completed before 200ms cancel)")
 	} else {
 		t.Logf("rep.Summary.Total = %d (partial report, expected)", rep.Summary.Total)
+	}
+}
+
+// fileCloserGenerator 是 TestRunnerClosesFileReader 专用的 Generator stub：
+// 每次 Generate 打开一份临时文件并返回 *os.File，同时记录最近返回的句柄，
+// 供测试事后验证 executeTask 已通过 defer rc.Close() 关闭。
+//
+// 并发安全：runner 用多 worker 并发调 Generate，lastFile 用 mutex 保护。
+type fileCloserGenerator struct {
+	path     string
+	mu       sync.Mutex
+	lastFile *os.File
+}
+
+func (g *fileCloserGenerator) Type() string { return "file" }
+func (g *fileCloserGenerator) Generate(size int64, taskID int) (io.Reader, error) {
+	f, err := os.Open(g.path)
+	if err != nil {
+		return nil, err
+	}
+	g.mu.Lock()
+	g.lastFile = f
+	g.mu.Unlock()
+	return f, nil
+}
+
+// LastFile 返回最近一次 Generate 打开的 *os.File（线程安全）。
+func (g *fileCloserGenerator) LastFile() *os.File {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.lastFile
+}
+
+// TestRunnerClosesFileReader 验证 executeTask 关闭 Generator 返回的 *os.File，
+// 避免 file 类型 Content 在长跑中耗尽 fd 上限。
+//
+// 原理：FileGenerator.Generate 返回 *os.File（实现 io.ReadCloser）。
+// executeTask 通过 `if rc, ok := reader.(io.ReadCloser); ok { defer rc.Close() }`
+// 在 Upload 完成后关闭。本测试跑 N 个 Task，每个 Task 一个独立 fd，
+// 跑完后对最后一个返回的 *os.File 再次调 Close —— 第二次 Close 应返回
+// os.ErrClosed（证明第一次已关）。
+//
+// 若 defer rc.Close() 缺失，第二次 Close 不会报 os.ErrClosed（fd 仍打开），
+// 测试失败。
+func TestRunnerClosesFileReader(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "payload.bin")
+	if err := os.WriteFile(path, bytes.Repeat([]byte{'A'}, 256), 0644); err != nil {
+		t.Fatal(err)
+	}
+
+	gen := &fileCloserGenerator{path: path}
+
+	const total = 20
+	cfg := Config{
+		EndpointName: "test",
+		EndpointURL:  "http://x",
+		Bucket:       "b",
+		Methods:      []string{"put"},
+		Total:        total,
+		Concurrency:  4,
+		KeyPrefix:    "k/",
+		Verify:       false,
+		Cleanup:      false,
+		Timeout:      10 * time.Second,
+		OutPrefix:    "out",
+		ContentSeed:  1,
+		Content:      gen,
+		Sizes:        []config.SizeBucket{{Min: 256, Max: 256, Weight: 100}},
+		UploaderFactory: map[string]func(*s3.Client) uploader.Uploader{
+			"put": func(c *s3.Client) uploader.Uploader {
+				return &mockUploader{method: "put", result: uploader.UploadResult{BytesIn: 256}}
+			},
+		},
+		S3Client: s3.New(s3.Options{
+			BaseEndpoint: aws.String("http://x"),
+			Region:       "us-east-1",
+			Credentials:  credentials.NewStaticCredentialsProvider("a", "b", ""),
+			UsePathStyle: true,
+		}),
+	}
+
+	r := New(cfg, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	if _, err := r.Run(context.Background()); err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+
+	if gen.LastFile() == nil {
+		t.Fatal("gen.LastFile() == nil: Generator 未被调用，测试无法验证 fd 关闭")
+	}
+	// 第二次 Close：executeTask 的 defer 已关；这里再关一次应返回 os.ErrClosed。
+	// 若 executeTask 未关 fd，此 Close 会成功（返回 nil），测试失败。
+	if err := gen.LastFile().Close(); err == nil {
+		t.Errorf("gen.LastFile().Close() 返回 nil，期望 os.ErrClosed —— executeTask 未关闭 fd，存在 fd 泄漏")
+	} else if !errors.Is(err, os.ErrClosed) {
+		t.Errorf("gen.LastFile().Close() err = %v，期望 os.ErrClosed", err)
 	}
 }
