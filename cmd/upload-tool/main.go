@@ -72,7 +72,7 @@ func realMain(args []string, stderr, stdout io.Writer) error {
 	logger := slog.New(slog.NewTextHandler(stderr, &slog.HandlerOptions{Level: level}))
 
 	if flagBool(fs, "dry-run", false) {
-		return runDryRunWith(*cfg, logger, stderr)
+		return runDryRunWith(*cfg, stderr)
 	}
 
 	return runReal(*cfg, flagBool(fs, "report-results", false), logger, stderr)
@@ -170,22 +170,19 @@ func loadAndApply(fs *flag.FlagSet, args []string) (*config.Config, error) {
 }
 
 // runDryRun 加载并校验 config 后进入 dry-run 预览路径。
-// 第三个 io.Writer 参数为与 brief 对齐的占位（当前未使用）。
 // 失败（Load / Validate）时直接返回 error，由调用方决定退出码。
-func runDryRun(cfgPath string, w io.Writer, _ io.Writer) error {
+func runDryRun(cfgPath string, w io.Writer) error {
 	cfg, err := config.Load(cfgPath)
 	if err != nil {
 		return err
 	}
-	logger := slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: slog.LevelInfo}))
-	return runDryRunWith(*cfg, logger, w)
+	return runDryRunWith(*cfg, w)
 }
 
-// runDryRunWith 接收已加载的 config 与 logger，向 w 打印 dry-run 摘要：
+// runDryRunWith 接收已加载的 config，向 w 打印 dry-run 摘要：
 // final config 关键字段、Sampler 采样后的首 10 条 task 预览。
 // task 预览包含 Method、Key（KeyPrefix + 时间戳 + 4 位序号）、采样 Size。
-func runDryRunWith(cfg config.Config, logger *slog.Logger, w io.Writer) error {
-	_ = logger // logger 当前保留供后续扩展，dry-run 文本输出直接走 w
+func runDryRunWith(cfg config.Config, w io.Writer) error {
 	fmt.Fprintln(w, "=== Dry Run ===")
 	fmt.Fprintln(w, "Config OK")
 	fmt.Fprintln(w)

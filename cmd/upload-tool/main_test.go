@@ -63,7 +63,7 @@ func TestDryRunPrintsConfig(t *testing.T) {
 	dir := t.TempDir()
 	cfgPath := writeConfig(t, dir, "c.yaml", baseYAML)
 	var buf bytes.Buffer
-	if err := runDryRun(cfgPath, &buf, &buf); err != nil {
+	if err := runDryRun(cfgPath, &buf); err != nil {
 		t.Fatal(err)
 	}
 	out := buf.String()
@@ -92,7 +92,7 @@ runner:
   total: 5
 `
 	cfgPath := writeConfig(t, dir, "bad.yaml", bad)
-	if err := runDryRun(cfgPath, &bytes.Buffer{}, &bytes.Buffer{}); err == nil {
+	if err := runDryRun(cfgPath, &bytes.Buffer{}); err == nil {
 		t.Errorf("expected error from invalid config")
 	}
 }
