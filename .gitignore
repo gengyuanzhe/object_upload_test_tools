@@ -8,6 +8,10 @@
 *.so
 *.dylib
 
+# Local build artifacts
+/upload-tool
+/upload-tool-*
+
 # Test binary, built with `go test -c`
 *.test
 
@@ -29,8 +33,8 @@ go.work.sum
 .env
 
 # Editor/IDE
-# .idea/
-# .vscode/
+.idea/
+.vscode/
 
 # Claude Code local settings
 .claude/
